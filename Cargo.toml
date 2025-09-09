@@ -2,5 +2,8 @@
 name = "wirehair"
 version = "0.1.0"
 edition = "2024"
+description = "WireHair Forward Error Correction"
+repository = "https://github.com/daibo83/wirehair-rs"
+license = "MIT"
 
 [dependencies]
