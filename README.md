@@ -1,4 +1,4 @@
-Wirehair implementation in Rust, currently 2x as slow as the C++ version.
+Wirehair implementation in Rust, currently exhibits about the same performance as the C++ version.
 
 Usage:
 
