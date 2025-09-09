@@ -10,7 +10,7 @@ Google Congestion Control is the congestion control algorithm used in WebRTC. It
 
 All licensing from the original source code is preserved under a BSD-style license. Thanks to the WebRTC project authors for their hard work on this implementation. All I did was port it to Rust";
 
-    // Choose a block size (e.g. 8 bytes per block)
+    // Choose a block size (e.g. 32 bytes per block)
     let block_size_bytes: u32 = 32;
     let now = std::time::Instant::now();
     // 2. Create encoder

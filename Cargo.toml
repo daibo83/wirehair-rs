@@ -7,3 +7,4 @@ repository = "https://github.com/daibo83/wirehair-rs"
 license = "MIT"
 
 [dependencies]
+gf256 = "0.3.1"

@@ -1,242 +1,74 @@
 // Wirehair Forward Error Correction Implementation
 // Optimized for speed with SIMD, cache-friendly layouts, and minimal allocations
 
-use std::arch::x86_64::*;
-
-// Optimized Galois Field 256 operations
-mod gf256 {
-    use super::*;
-
-    static mut LOG_TABLE: [u8; 256] = [0; 256];
-    static mut EXP_TABLE: [u8; 512] = [0; 512];
-    static mut MUL_TABLE: [[u8; 256]; 256] = [[0; 256]; 256];
-    static INIT: std::sync::Once = std::sync::Once::new();
-
-    pub fn init() {
-        INIT.call_once(|| unsafe {
-            // Generate exp/log tables for GF(256) with polynomial 0x11d
-            let mut x = 1u8;
-            for i in 0..255 {
-                EXP_TABLE[i] = x;
-                EXP_TABLE[i + 255] = x;
-                LOG_TABLE[x as usize] = i as u8;
-
-                // Multiply by generator (2)
-                x = (x << 1) ^ if x & 0x80 != 0 { 0x1d } else { 0 };
-            }
-            LOG_TABLE[0] = 0;
-
-            // Precompute multiplication table
-            for a in 0..256 {
-                for b in 0..256 {
-                    if a == 0 || b == 0 {
-                        MUL_TABLE[a][b] = 0;
-                    } else {
-                        let log_sum = (LOG_TABLE[a] as u16 + LOG_TABLE[b] as u16) % 255;
-                        MUL_TABLE[a][b] = EXP_TABLE[log_sum as usize];
-                    }
-                }
-            }
-        });
-    }
-
-    #[inline(always)]
-    pub fn mul(a: u8, b: u8) -> u8 {
-        unsafe { MUL_TABLE[a as usize][b as usize] }
-    }
-
-    #[inline(always)]
-    pub fn inv(a: u8) -> u8 {
-        unsafe {
-            if a == 0 {
-                return 0;
-            }
-            EXP_TABLE[255 - LOG_TABLE[a as usize] as usize]
-        }
-    }
-
-    // SIMD multiplication and add using AVX2
-    #[target_feature(enable = "avx2")]
-    pub unsafe fn mul_add_avx2(dst: *mut u8, src: *const u8, val: u8, len: usize) {
-        if val == 0 {
-            return;
-        }
-
-        // For small lengths or val == 1, use scalar
-        if len < 32 || val == 1 {
-            for i in 0..len {
-                unsafe { *dst.add(i) ^= if val == 1 {
-                    *src.add(i)
-                } else {
-                    mul(*src.add(i), val)
-                } };
-            }
-            return;
-        }
-
-        let chunks = len / 32;
-        let remainder = len % 32;
-
-        // Build lookup tables for SIMD multiplication
-        // Build 16-entry nibble LUTs and duplicate to 32 bytes (one per 128-bit lane)
-        let mut lo_table32 = [0u8; 32];
-        let mut hi_table32 = [0u8; 32];
-        for i in 0..16 {
-            let lo = mul(i as u8, val);
-            let hi = mul(((i as u8) << 4) as u8, val);
-            lo_table32[i] = lo;
-            lo_table32[i + 16] = lo; // duplicate for upper lane
-            hi_table32[i] = hi;
-            hi_table32[i + 16] = hi; // duplicate for upper lane
-        }
-
-        let lo_lut = unsafe { _mm256_loadu_si256(lo_table32.as_ptr() as *const __m256i) };
-        let hi_lut = unsafe { _mm256_loadu_si256(hi_table32.as_ptr() as *const __m256i) };
-        let mask = _mm256_set1_epi8(0x0f);
-
-        // Process 32 bytes at a time
-        for i in 0..chunks {
-            let offset = i * 32;
-            let src_vec = unsafe { _mm256_loadu_si256(src.add(offset) as *const __m256i) };
-            let dst_vec = unsafe { _mm256_loadu_si256(dst.add(offset) as *const __m256i) };
-
-            // Split into nibbles
-            let lo = _mm256_and_si256(src_vec, mask);
-            let hi = _mm256_srli_epi16(src_vec, 4);
-            let hi = _mm256_and_si256(hi, mask);
-
-            // Table lookup multiplication
-            let prod_lo = _mm256_shuffle_epi8(lo_lut, lo);
-            let prod_hi = _mm256_shuffle_epi8(hi_lut, hi);
-            let prod = _mm256_xor_si256(prod_lo, prod_hi);
-
-            // XOR with destination
-            let result = _mm256_xor_si256(dst_vec, prod);
-            unsafe { _mm256_storeu_si256(dst.add(offset) as *mut __m256i, result) };
-        }
-
-        // Handle remainder
-        for i in 0..remainder {
-            let idx = chunks * 32 + i;
-            unsafe { *dst.add(idx) ^= mul(*src.add(idx), val) };
-        }
-    }
-
-    // Scalar multiplication and add
-    pub fn mul_add_scalar(dst: &mut [u8], src: &[u8], val: u8) {
-        if val == 0 {
-            return;
-        }
-
-        let len = dst.len().min(src.len());
-        if val == 1 {
-            for i in 0..len {
-                dst[i] ^= src[i];
-            }
-        } else {
-            for i in 0..len {
-                dst[i] ^= mul(src[i], val);
-            }
-        }
-    }
-}
-
+use gf256::gf::gf256;
 // Main Wirehair encoder
+
 pub struct Encoder {
-    k: usize,          // Number of source blocks
-    block_size: usize, // Size of each block
-    data: Vec<u8>,     // Source data
-    seed: u32,         // Random seed for encoding
+    k: usize,
+    block_size: usize,
+    data: Vec<u8>,
+    seed: u32,
 }
 
 impl Encoder {
     pub fn new(data: Vec<u8>, k: usize, block_size: usize) -> Self {
-        gf256::init();
-
-        // Ensure data is properly padded
         let mut padded_data = data;
-        let expected_size = k * block_size;
-        padded_data.resize(expected_size, 0);
+        padded_data.resize(k * block_size, 0);
 
         Encoder {
             k,
             block_size,
             data: padded_data,
-            seed: 0x12345678, // Fixed seed for reproducibility
+            seed: 0x12345678,
         }
     }
 
-    // Generate encoding symbols using optimized random linear combinations
     pub fn encode(&self, symbol_id: u32) -> Vec<u8> {
-        // Systematic first:
         if (symbol_id as usize) < self.k {
+            // Systematic: return original block
             let i = symbol_id as usize;
-            return self.data[i * self.block_size..(i + 1) * self.block_size].to_vec();
+            return self.data[i * self.block_size .. (i + 1) * self.block_size].to_vec();
         }
 
         let mut output = vec![0u8; self.block_size];
         let mut rng = Xorshift32::new(self.seed ^ symbol_id);
 
         for i in 0..self.k {
-            let coeff = (rng.next() & 0xFF) as u8;
-            if coeff == 0 {
-                continue;
-            }
+            let coeff = gf256((rng.next() & 0xFF) as u8);
+            if coeff == gf256(0) { continue; }
 
-            let src_block = &self.data[i * self.block_size..(i + 1) * self.block_size];
-
-            unsafe {
-                if is_x86_feature_detected!("avx2") {
-                    gf256::mul_add_avx2(
-                        output.as_mut_ptr(),
-                        src_block.as_ptr(),
-                        coeff,
-                        self.block_size,
-                    );
-                } else {
-                    gf256::mul_add_scalar(&mut output, src_block, coeff);
-                }
+            let src_block = &self.data[i * self.block_size .. (i + 1) * self.block_size];
+            for j in 0..self.block_size {
+                let dst_val = gf256(output[j]);
+                let src_val = gf256(src_block[j]);
+                output[j] = (dst_val + coeff * src_val).0;
             }
         }
 
         output
     }
-
-    // Get coefficient for a specific source block in a symbol
-    fn get_coefficient(&self, symbol_id: u32, block_idx: usize) -> u8 {
-        let mut rng = Xorshift32::new(self.seed ^ symbol_id);
-        for idx in 0..=block_idx {
-            if block_idx == idx {
-                return (rng.next() & 0xFF) as u8;
-            }
-            rng.next();
-        }
-        0
-    }
 }
-
 // Main Wirehair decoder with optimized Gaussian elimination
+
+
 pub struct Decoder {
     k: usize,
     block_size: usize,
-    matrix: Vec<Vec<u8>>,  // Coefficient matrix
-    symbols: Vec<Vec<u8>>, // Received symbol data
-    symbol_ids: Vec<u32>,  // IDs of received symbols
+    matrix: Vec<Vec<gf256>>,   // coefficient matrix
+    symbols: Vec<Vec<u8>>,     // received symbol data
     seed: u32,
     decoded: bool,
-    decoded_blocks: Vec<Vec<u8>>, // Decoded source blocks
+    decoded_blocks: Vec<Vec<u8>>,
 }
 
 impl Decoder {
     pub fn new(k: usize, block_size: usize) -> Self {
-        gf256::init();
-
         Decoder {
             k,
             block_size,
             matrix: Vec::new(),
             symbols: Vec::new(),
-            symbol_ids: Vec::new(),
             seed: 0x12345678,
             decoded: false,
             decoded_blocks: vec![vec![0u8; block_size]; k],
@@ -248,21 +80,20 @@ impl Decoder {
             return true;
         }
 
-        // Coefficients must match the encoder exactly:
-        let mut coeffs = vec![0u8; self.k];
+        let mut coeffs = vec![gf256(0); self.k];
         if (symbol_id as usize) < self.k {
-            // Systematic row e_i
-            coeffs[symbol_id as usize] = 1;
+            // Systematic identity row
+            coeffs[symbol_id as usize] = gf256(1);
         } else {
+            // Random coefficients
             let mut rng = Xorshift32::new(self.seed ^ symbol_id);
             for i in 0..self.k {
-                coeffs[i] = (rng.next() & 0xFF) as u8;
+                coeffs[i] = gf256((rng.next() & 0xFF) as u8);
             }
         }
 
         self.matrix.push(coeffs);
         self.symbols.push(data);
-        self.symbol_ids.push(symbol_id);
 
         if self.symbols.len() >= self.k {
             self.decoded = self.gaussian_elimination();
@@ -271,87 +102,77 @@ impl Decoder {
         self.decoded
     }
 
-    // Perform Gaussian elimination to solve the system
     fn gaussian_elimination(&mut self) -> bool {
         let n = self.symbols.len();
         if n < self.k {
             return false;
         }
 
-        // Create augmented matrix (coefficients | symbols)
         let mut aug_matrix = self.matrix.clone();
         let mut aug_symbols = self.symbols.clone();
 
-        // Forward elimination to get row echelon form
         for col in 0..self.k {
-            // Find pivot row with non-zero element in current column
+            // Find pivot
             let mut pivot_row = None;
             for row in col..n {
-                if aug_matrix[row][col] != 0 {
+                if aug_matrix[row][col] != gf256(0) {
                     pivot_row = Some(row);
                     break;
                 }
             }
+            let Some(prow) = pivot_row else { continue };
 
-            let Some(prow) = pivot_row else {
-                // No pivot found, system is not solvable
-                return false;
-            };
-
-            // Swap pivot row to current position
+            // Swap rows
             if prow != col {
                 aug_matrix.swap(col, prow);
                 aug_symbols.swap(col, prow);
             }
 
-            // Scale pivot row to have leading 1
+            // Normalize pivot row
             let pivot_val = aug_matrix[col][col];
-            if pivot_val != 1 {
-                let inv = gf256::inv(pivot_val);
-                for j in col..self.k {
-                    // Start from col instead of 0
-                    aug_matrix[col][j] = gf256::mul(aug_matrix[col][j], inv);
+            if pivot_val != gf256(1) {
+                let inv = gf256(1) / pivot_val;
+                for j in 0..self.k {
+                    aug_matrix[col][j] *= inv;
                 }
                 for j in 0..self.block_size {
-                    aug_symbols[col][j] = gf256::mul(aug_symbols[col][j], inv);
+                    aug_symbols[col][j] = (gf256(aug_symbols[col][j]) * inv).0;
                 }
             }
 
-            // Eliminate column in all other rows
+            // Eliminate column from other rows
             for row in 0..n {
                 if row == col {
                     continue;
                 }
-
                 let factor = aug_matrix[row][col];
-                if factor == 0 {
+                if factor == gf256(0) {
                     continue;
                 }
 
-                // Subtract factor * pivot_row from current row
-                for j in col..self.k {
-                    // Start from col for efficiency
-                    aug_matrix[row][j] ^= gf256::mul(aug_matrix[col][j], factor);
+                for j in 0..self.k {
+                    let a = aug_matrix[col][j] * factor;
+                    aug_matrix[row][j] -= a;
                 }
-
-                // Update symbol data
                 for j in 0..self.block_size {
-                    aug_symbols[row][j] ^= gf256::mul(aug_symbols[col][j], factor);
+                    let val = gf256(aug_symbols[row][j])
+                        - gf256(aug_symbols[col][j]) * factor;
+                    aug_symbols[row][j] = val.0;
                 }
             }
         }
 
-        // Check if we have identity matrix in first k rows
+        // Check if we have identity matrix
         for i in 0..self.k {
             for j in 0..self.k {
-                let expected = if i == j { 1 } else { 0 };
+                let expected = if i == j { gf256(1) } else { gf256(0) };
                 if aug_matrix[i][j] != expected {
                     return false;
                 }
             }
         }
 
-        // If we have identity matrix, the first k symbols are the decoded blocks
+        // Extract decoded blocks
         for i in 0..self.k {
             self.decoded_blocks[i] = aug_symbols[i].clone();
         }
@@ -363,12 +184,10 @@ impl Decoder {
         if !self.decoded {
             return None;
         }
-
         let mut result = Vec::with_capacity(self.k * self.block_size);
         for block in &self.decoded_blocks {
             result.extend_from_slice(block);
         }
-
         Some(result)
     }
 
@@ -376,6 +195,7 @@ impl Decoder {
         self.decoded
     }
 }
+
 
 // Fast PRNG for coefficient generation
 struct Xorshift32 {
@@ -461,23 +281,6 @@ mod tests {
         assert!(decoder.is_decoded());
         let decoded = decoder.get_decoded().unwrap();
         assert_eq!(decoded, data);
-    }
-
-    #[test]
-    fn test_gf256_operations() {
-        gf256::init();
-
-        // Test multiplication properties
-        assert_eq!(gf256::mul(0, 5), 0);
-        assert_eq!(gf256::mul(5, 0), 0);
-        assert_eq!(gf256::mul(1, 5), 5);
-        assert_eq!(gf256::mul(5, 1), 5);
-
-        // Test inverse
-        for i in 1..256 {
-            let inv = gf256::inv(i as u8);
-            assert_eq!(gf256::mul(i as u8, inv), 1);
-        }
     }
 
     #[test]
