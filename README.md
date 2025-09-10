@@ -18,8 +18,7 @@ All licensing from the original source code is preserved under a BSD-style licen
     let mut decoder = Decoder::new(22, block_size_bytes as usize);
     for block_id in 0..25 {
         let block_buf = encoder.encode(block_id);
-        // block_buf.truncate(block_out_bytes as usize);
-        if block_id %10 == 0 {
+        if block_id %10 == 0 { // simulate 10% packet loss
             continue;
         }
         decoder.add_symbol(block_id as u32, block_buf);
